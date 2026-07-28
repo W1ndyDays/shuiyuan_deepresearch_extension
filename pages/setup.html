@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>水源深度搜索 · 初始设置</title>
+  <link rel="stylesheet" href="common.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="page">
+      <h1>水源深度搜索</h1>
+      <span class="sub">初始设置</span>
+      <a href="search.html">前往搜索页 →</a>
+    </header>
+
+    <!-- Step 1: Shuiyuan auth -->
+    <section class="card" id="auth-card">
+      <h2><span class="step-num">1</span> 水源社区授权 <span id="auth-status" class="status warn">检查中…</span></h2>
+      <p class="hint">
+        点击下方按钮会打开水源社区的授权页面（需要已登录水源）。点击页面上的「授权」后，
+        插件会<strong>自动捕获</strong>授权凭证并保存，无需手动复制。授权仅申请<strong>只读 (read)</strong> 权限。
+      </p>
+      <div class="row">
+        <button id="btn-auth">开始授权</button>
+        <button id="btn-auth-recheck" class="secondary">刷新状态</button>
+        <span id="auth-waiting" class="hidden"><span class="spinner"></span> 等待授权完成…</span>
+      </div>
+      <div id="auth-msg" class="msg"></div>
+      <details style="margin-top:12px">
+        <summary style="cursor:pointer;font-size:13px;color:var(--muted)">自动捕获失败？手动粘贴授权码</summary>
+        <label for="manual-payload">授权页面显示的加密授权码 (payload)</label>
+        <textarea id="manual-payload" rows="3" placeholder="粘贴授权页面显示的一长串字符…"></textarea>
+        <div class="row"><button id="btn-manual-finish" class="secondary">提交授权码</button></div>
+      </details>
+    </section>
+
+    <!-- Step 2: LLM config -->
+    <section class="card" id="llm-card">
+      <h2><span class="step-num">2</span> AI 模型配置 <span id="llm-status" class="status warn">未配置</span></h2>
+      <p class="hint">
+        深度搜索使用你自己的大模型 API Key（Key 仅保存在本机浏览器中，只会发送给你填写的 API 服务商）。
+      </p>
+      <label for="llm-preset">服务商预设</label>
+      <select id="llm-preset"></select>
+      <label for="llm-base">API Base URL</label>
+      <input type="text" id="llm-base" placeholder="https://api.deepseek.com/v1">
+      <label for="llm-style">接口风格</label>
+      <select id="llm-style">
+        <option value="openai">OpenAI 兼容 (chat/completions)</option>
+        <option value="anthropic">Anthropic (messages)</option>
+      </select>
+      <label for="llm-model">模型名</label>
+      <input type="text" id="llm-model" placeholder="deepseek-chat">
+      <label for="llm-key">API Key</label>
+      <input type="password" id="llm-key" placeholder="sk-…" autocomplete="off">
+      <div class="row">
+        <button id="btn-llm-save">保存配置</button>
+        <button id="btn-llm-test" class="secondary">测试连接</button>
+        <span id="llm-testing" class="hidden"><span class="spinner"></span> 测试中…</span>
+      </div>
+      <div id="llm-msg" class="msg"></div>
+    </section>
+
+    <!-- Step 3: done -->
+    <section class="card">
+      <h2><span class="step-num">3</span> 完成</h2>
+      <p class="hint">两步都完成后，点击工具栏中的插件图标或下方按钮即可开始深度搜索。</p>
+      <div class="row"><button id="btn-go-search">开始深度搜索 →</button></div>
+    </section>
+  </div>
+  <script type="module" src="setup.js"></script>
+</body>
+</html>

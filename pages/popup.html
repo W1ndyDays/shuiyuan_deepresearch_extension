@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="common.css">
+  <style>
+    body { width: 430px; background: var(--bg); }
+    .pwrap { padding: 14px 14px 14px; }
+    header.page { margin-bottom: 12px; }
+    .logo { width: 30px; height: 30px; border-radius: 9px; font-size: 15px; }
+    header.page h1 { font-size: 15.5px; }
+    .searchbar input { font-size: 14px; padding: 10px 13px; }
+    .searchbar button { padding: 10px 18px; font-size: 14px; }
+    .opts { gap: 12px; margin-top: 9px; font-size: 12px; }
+    #progress-box { margin-top: 10px; }
+    #progress { max-height: 235px; overflow-y: auto; }
+    #report-box { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+    #report { max-height: 280px; overflow-y: auto; font-size: 13px; }
+    #report h1, #report h2 { font-size: 14px; }
+    #chat-box { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+    #chat { max-height: 260px; overflow-y: auto; }
+    .footrow { display: flex; gap: 8px; margin-top: 10px; }
+    .footrow button { font-size: 12px; padding: 6px 12px; }
+    #view-history { min-height: 120px; }
+  </style>
+</head>
+<body>
+  <div class="pwrap">
+    <header class="page">
+      <div class="logo">源</div>
+      <h1>水源深度搜索</h1>
+      <div class="spacer"></div>
+      <a href="#" id="lnk-fullpage" class="iconlink" title="在完整页面打开">⤢</a>
+      <a href="#" id="lnk-setup" class="iconlink" title="设置">⚙</a>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" id="tab-search">搜索</button>
+      <button class="tab" id="tab-history">历史记录</button>
+    </nav>
+
+    <div id="notice" class="msg err hidden"></div>
+
+    <!-- 搜索视图 -->
+    <section id="view-search">
+      <div class="searchbar">
+        <input type="text" id="q" placeholder="想深入了解什么话题？">
+        <button id="btn-go">搜索</button>
+      </div>
+      <div class="opts">
+        <span>agent
+          <select id="opt-agents"><option>2</option><option selected>4</option><option>6</option></select>
+        </span>
+        <span>轮数
+          <select id="opt-rounds"><option>1</option><option selected>2</option><option>3</option></select>
+        </span>
+        <span>精读
+          <select id="opt-topics"><option>1</option><option selected>2</option><option>3</option></select>
+        </span>
+        <button id="btn-stop" class="secondary hidden">停止</button>
+        <span id="phase-badge" class="status warn hidden"></span>
+      </div>
+      <div id="run-topic"></div>
+
+      <div id="progress-box" class="hidden">
+        <div id="progress"></div>
+      </div>
+
+      <div id="report-box" class="hidden">
+        <div id="report"></div>
+        <div id="report-meta" class="hint"></div>
+        <div class="footrow">
+          <button id="btn-open-full" class="ghost">在完整页面查看 ⤢</button>
+        </div>
+      </div>
+
+      <div id="chat-box" class="hidden">
+        <div id="chat"></div>
+        <div id="chat-status" class="hidden"></div>
+        <div class="chat-inputrow">
+          <input type="text" id="chat-q" placeholder="就这次搜索继续追问…">
+          <button id="btn-ask">追问</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 历史视图 -->
+    <section id="view-history" class="hidden">
+      <div id="history-list"></div>
+    </section>
+  </div>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
