@@ -13,6 +13,8 @@
   window.__syDeepSearchAuthCapture = true;
 
   var done = false;
+  var inflight = false; // one auth_finish at a time; Ember fires many mutations
+  var lastSubmitted = null;
   var attempts = 0;
   var MAX_ATTEMPTS = 240; // ~2 minutes at 500ms
 
@@ -48,10 +50,19 @@
   }
 
   function submit(payload) {
+    // The payload can only be consumed once (auth_finish clears the pending
+    // session), so never let concurrent submissions pile up.
+    if (done || inflight || payload === lastSubmitted) return;
+    inflight = true;
+    lastSubmitted = payload;
     chrome.runtime.sendMessage(
       { type: "sy.payloadCaptured", payload: payload },
       function (res) {
-        if (chrome.runtime.lastError) return; // SW unavailable; keep polling
+        inflight = false;
+        if (chrome.runtime.lastError) {
+          lastSubmitted = null; // SW unavailable; allow a retry
+          return;
+        }
         if (res && res.ok) {
           done = true;
           showBanner("✅ 水源深度搜索：授权成功，此页面即将自动关闭。", true);

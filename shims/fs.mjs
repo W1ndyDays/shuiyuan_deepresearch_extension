@@ -20,6 +20,16 @@ const STORAGE_KEY = "memfs";
 // normalized absolute path -> { data: Uint8Array, mtimeMs: number }
 const files = new Map();
 
+// Persistence is fire-and-forget, but a failure means the credential the user
+// just authorized will vanish on the next worker restart — so remember it and
+// let the UI surface it instead of failing silently.
+let lastPersistError = null;
+
+/** Last chrome.storage write failure (message), or null. */
+export function __persistError() {
+  return lastPersistError;
+}
+
 function normalizeKey(p) {
   return path.resolve(String(p));
 }
@@ -37,13 +47,20 @@ function persist() {
   for (const [key, entry] of files) {
     snapshot[key] = { data: base64FromBytes(entry.data, false), mtimeMs: entry.mtimeMs };
   }
+  const fail = (err) => {
+    lastPersistError = err?.message || String(err);
+  };
   try {
     const maybePromise = backend.set({ [STORAGE_KEY]: snapshot });
     if (maybePromise && typeof maybePromise.catch === "function") {
-      maybePromise.catch(() => {});
+      maybePromise.then(() => {
+        lastPersistError = null;
+      }, fail);
+    } else {
+      lastPersistError = null;
     }
-  } catch {
-    // Best effort persistence only.
+  } catch (err) {
+    fail(err);
   }
 }
 

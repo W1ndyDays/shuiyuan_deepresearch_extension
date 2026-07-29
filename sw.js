@@ -11,14 +11,23 @@
 //        broadcast {type: "sy.authCompleted", ok}
 //   {type: "sy.status"}                   -> {auth, llmConfigured}
 //   {type: "sy.search.start", topic, options} -> starts a background deep search
-//   {type: "sy.search.stop"}              -> aborts the current run
+//   {type: "sy.search.stop"}              -> aborts the current run (and follow-up)
 //   {type: "sy.search.state"}             -> full run state (status/events/report)
+//   {type: "sy.chat.ask", question, sessionId} -> follow-up on the active session
+//        (sessionId must match the active historyId, or the ask is refused —
+//         another surface may have switched the worker's active session)
+//   {type: "sy.chat.stop"}                -> aborts the in-flight follow-up
 // Broadcasts while a search runs:
 //   {type: "sy.searchEvent", event}       — one deepsearch progress event
-//   {type: "sy.searchDone", status, error}
+//   {type: "sy.searchDone", status, error, historyError}
+//   {type: "sy.storageWarning", error}    — chrome.storage write failed
+//
+// There is exactly ONE active run object. It may be replaced at any time (new
+// search, opening a history entry), so every async writer captures its own `run`
+// and checks ownsRun() before mutating shared state or broadcasting.
 
 import "./shims/buffer.mjs";
-import { __hydrate } from "./shims/fs.mjs";
+import { __hydrate, __persistError } from "./shims/fs.mjs";
 import { __rsaPool } from "./shims/crypto.mjs";
 import { deepSearch, followUp } from "./lib/deepsearch.mjs";
 import {
@@ -39,13 +48,65 @@ import {
 } from "./core/shuiyuan_core.mjs";
 
 const APPLICATION_NAME = "Shuiyuan Deep Search (browser extension)";
+const RUN_MARKER_KEY = "activeRun";
+
+let searchRun = null; // {topic, options, status, events, report, meta, error,
+//                       startedAt, finishedAt, controller, chatController,
+//                       conversation, followUps, historyId, chatBusy,
+//                       historyError}
+let starting = false; // set synchronously; closes the start() race window
+
+// A run whose worker died mid-flight: nothing will ever finish it, so report it
+// as failed instead of leaving every surface spinning forever.
+function interruptedRun(marker) {
+  return {
+    topic: marker.topic || "",
+    options: {},
+    status: "error",
+    events: [],
+    report: null,
+    meta: null,
+    error: `上次「${marker.topic || "未知话题"}」的深度搜索被浏览器中断（后台 Service Worker 被回收），请重新搜索。`,
+    startedAt: marker.startedAt || 0,
+    finishedAt: null,
+    controller: null,
+    chatController: null,
+    conversation: null,
+    followUps: [],
+    historyId: null,
+    chatBusy: false,
+    historyError: null,
+  };
+}
 
 // memfs must be hydrated from chrome.storage.local before any execute() call —
-// the SW restarts often and starts with an empty in-memory fs.
-const ready = chrome.storage.local
-  .get("memfs")
-  .then((stored) => __hydrate(stored.memfs))
-  .catch(() => __hydrate(null));
+// the SW restarts often and starts with an empty in-memory fs. The same boot
+// pass adopts any orphaned run marker (see interruptedRun).
+// Each step is guarded separately on purpose: a failure while adopting the
+// marker must never fall through to __hydrate(null), which would throw away the
+// credentials we just loaded.
+const ready = (async () => {
+  let stored = {};
+  try {
+    stored = await chrome.storage.local.get(["memfs", RUN_MARKER_KEY]);
+  } catch {
+    // Storage unreadable — continue with an empty fs.
+  }
+  try {
+    __hydrate(stored.memfs);
+  } catch {
+    __hydrate(null);
+  }
+  try {
+    const marker = stored[RUN_MARKER_KEY];
+    if (marker && typeof marker === "object") {
+      searchRun = interruptedRun(marker);
+      await chrome.storage.local.remove(RUN_MARKER_KEY);
+    }
+  } catch {
+    // Best effort: a stale marker only costs one bogus "interrupted" notice.
+  }
+})();
 
 function makeCtx() {
   return {
@@ -107,13 +168,15 @@ function broadcast(message) {
 
 // ------------------------------------------------------ deep-search runner ----
 
-let searchRun = null; // {topic, options, status, events, report, meta, error,
-//                       startedAt, finishedAt, controller, conversation,
-//                       followUps, historyId, chatBusy}
 let keepaliveTimer = null;
 
 const HISTORY_KEY = "history";
 const HISTORY_MAX = 30;
+
+/** Every write to the shared run state must first prove it still owns it. */
+function ownsRun(run) {
+  return run != null && run === searchRun;
+}
 
 async function loadHistory() {
   const { [HISTORY_KEY]: history } = await chrome.storage.local.get(HISTORY_KEY);
@@ -129,17 +192,29 @@ async function saveHistoryEntry(entry) {
   await chrome.storage.local.set({ [HISTORY_KEY]: history });
 }
 
-async function updateHistoryFromRun() {
-  if (!searchRun?.historyId) return;
-  await saveHistoryEntry({
-    id: searchRun.historyId,
-    topic: searchRun.topic,
-    report: searchRun.report,
-    meta: searchRun.meta,
-    finishedAt: searchRun.finishedAt,
-    conversation: searchRun.conversation,
-    followUps: searchRun.followUps,
-  });
+/**
+ * Persist a finished run/turn. Storage can legitimately fail (quota, disk), and
+ * that must NOT turn a successful search into a failed one — the report is
+ * already in hand. Record the problem on the run so the UI can warn instead.
+ */
+async function persistRun(run) {
+  if (!run?.historyId) return;
+  try {
+    await saveHistoryEntry({
+      id: run.historyId,
+      topic: run.topic,
+      report: run.report,
+      meta: run.meta,
+      finishedAt: run.finishedAt,
+      conversation: run.conversation,
+      followUps: run.followUps,
+    });
+    if (ownsRun(run)) run.historyError = null;
+  } catch (err) {
+    const message = err?.message || String(err);
+    if (ownsRun(run)) run.historyError = message;
+    broadcast({ type: "sy.storageWarning", error: message });
+  }
 }
 
 // MV3 SWs idle out after ~30s; a periodic trivial extension-API call keeps the
@@ -171,134 +246,220 @@ async function syLocal(kind, args) {
   }
 }
 
-function pushSearchEvent(event) {
-  if (!searchRun) return;
-  searchRun.events.push(event);
-  if (searchRun.events.length > 500) {
-    searchRun.events.splice(0, searchRun.events.length - 500);
+function pushSearchEvent(run, event) {
+  if (!ownsRun(run)) return; // a superseded run must not pollute the live one
+  run.events.push(event);
+  if (run.events.length > 500) {
+    run.events.splice(0, run.events.length - 500);
   }
   broadcast({ type: "sy.searchEvent", event });
 }
 
+// Clamp caller-supplied knobs: they drive fan-out over a rate-limited forum and
+// paid LLM calls, so a bad value must not become 10k agents (or zero).
+function sanitizeOptions(options) {
+  const num = (value, fallback, min, max) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, Math.round(n)));
+  };
+  const src = options && typeof options === "object" ? options : {};
+  const out = {};
+  if (src.agentsPerRound != null) out.agentsPerRound = num(src.agentsPerRound, 4, 1, 8);
+  if (src.maxRounds != null) out.maxRounds = num(src.maxRounds, 2, 1, 4);
+  if (src.topicsPerAgent != null) out.topicsPerAgent = num(src.topicsPerAgent, 2, 0, 5);
+  // Per-request LLM timeout; mainly a testing/tuning knob, clamped either way.
+  if (src.llmTimeoutMs != null) out.llmTimeoutMs = num(src.llmTimeoutMs, 120_000, 200, 300_000);
+  return out;
+}
+
 async function startDeepSearch({ topic, options }) {
-  if (searchRun?.status === "running") {
+  const cleanTopic = String(topic || "").trim();
+  if (!cleanTopic) throw new SkillError("请输入要研究的话题。");
+  // `starting` is set synchronously below, so a double-click (two messages sent
+  // before the UI can disable its button) can no longer start two runs.
+  if (starting || searchRun?.status === "running") {
     throw new SkillError("已有一个深度搜索正在进行，请先停止或等待完成。");
   }
-  const { llmConfig } = await chrome.storage.local.get("llmConfig");
-  if (!llmConfig?.apiKey || !llmConfig?.model || !llmConfig?.baseUrl) {
-    throw new SkillError("尚未配置 AI 模型，请先在设置页完成配置。");
+  if (searchRun?.chatBusy) {
+    throw new SkillError("追问正在处理中，请等待完成后再开始新搜索。");
   }
-  const auth = await execute(makeCtx(), { kind: "auth_status" });
-  if (!auth?.resolved?.found) {
-    throw new SkillError("尚未完成水源授权，请先在设置页完成授权。");
-  }
-
-  const controller = new AbortController();
-  searchRun = {
-    topic,
-    options: options || {},
-    status: "running",
-    events: [],
-    report: null,
-    meta: null,
-    error: null,
-    startedAt: Date.now(),
-    finishedAt: null,
-    controller,
-    conversation: null,
-    followUps: [],
-    historyId: null,
-    chatBusy: false,
-  };
-  startKeepalive();
-
-  (async () => {
-    try {
-      const result = await deepSearch({
-        topic,
-        llm: llmConfig,
-        sy: syLocal,
-        onEvent: pushSearchEvent,
-        signal: controller.signal,
-        options: searchRun.options,
-      });
-      searchRun.status = "done";
-      searchRun.report = result.report;
-      searchRun.conversation = result.conversation;
-      searchRun.finishedAt = Date.now();
-      searchRun.historyId = `s_${searchRun.finishedAt}`;
-      searchRun.meta = {
-        queriesExecuted: result.queriesExecuted.length,
-        topicsRead: result.topicsRead,
-        agentErrors: result.errors.length,
-        seconds: Math.round((Date.now() - searchRun.startedAt) / 1000),
-      };
-      await updateHistoryFromRun();
-    } catch (err) {
-      if (err?.name === "AbortError") {
-        searchRun.status = "stopped";
-      } else {
-        searchRun.status = "error";
-        searchRun.error = err?.message || String(err);
-      }
-    } finally {
-      stopKeepalive();
-      broadcast({
-        type: "sy.searchDone",
-        status: searchRun.status,
-        error: searchRun.error,
-      });
+  starting = true;
+  try {
+    const { llmConfig } = await chrome.storage.local.get("llmConfig");
+    if (!llmConfig?.apiKey || !llmConfig?.model || !llmConfig?.baseUrl) {
+      throw new SkillError("尚未配置 AI 模型，请先在设置页完成配置。");
     }
-  })();
+    const auth = await execute(makeCtx(), { kind: "auth_status" });
+    if (!auth?.resolved?.found) {
+      throw new SkillError("尚未完成水源授权，请先在设置页完成授权。");
+    }
 
-  return { started: true };
+    const controller = new AbortController();
+    const run = {
+      topic: cleanTopic,
+      options: sanitizeOptions(options),
+      status: "running",
+      events: [],
+      report: null,
+      meta: null,
+      error: null,
+      startedAt: Date.now(),
+      finishedAt: null,
+      controller,
+      chatController: null,
+      conversation: null,
+      followUps: [],
+      historyId: null,
+      chatBusy: false,
+      historyError: null,
+    };
+    // Installing the run is the last synchronous step: from here the "running"
+    // check above protects us, and every writer below re-checks ownership.
+    searchRun = run;
+    startKeepalive();
+    // The marker survives a worker kill; the next boot turns it into an error.
+    chrome.storage.local
+      .set({ [RUN_MARKER_KEY]: { topic: cleanTopic, startedAt: run.startedAt } })
+      .catch(() => {});
+
+    (async () => {
+      try {
+        const result = await deepSearch({
+          topic: cleanTopic,
+          llm: llmConfig,
+          sy: syLocal,
+          onEvent: (event) => pushSearchEvent(run, event),
+          signal: controller.signal,
+          options: run.options,
+        });
+        if (!ownsRun(run)) return; // superseded while we were working
+        run.status = "done";
+        run.report = result.report;
+        run.conversation = result.conversation;
+        run.finishedAt = Date.now();
+        run.historyId = `s_${run.finishedAt}`;
+        run.meta = {
+          queriesExecuted: result.queriesExecuted.length,
+          topicsRead: result.topicsRead,
+          agentErrors: result.errors.length,
+          degraded: Boolean(result.degraded),
+          seconds: Math.round((run.finishedAt - run.startedAt) / 1000),
+        };
+        await persistRun(run); // never fails the run; sets run.historyError
+      } catch (err) {
+        if (!ownsRun(run)) return;
+        if (err?.name === "AbortError") {
+          run.status = "stopped";
+        } else {
+          run.status = "error";
+          run.error = err?.message || String(err);
+        }
+      } finally {
+        if (ownsRun(run)) {
+          stopKeepalive();
+          chrome.storage.local.remove(RUN_MARKER_KEY).catch(() => {});
+          broadcast({
+            type: "sy.searchDone",
+            status: run.status,
+            error: run.error,
+            historyError: run.historyError || null,
+          });
+        }
+      }
+    })();
+
+    return { started: true };
+  } finally {
+    starting = false;
+  }
 }
 
 function searchState() {
   if (!searchRun) return { status: "idle" };
-  // conversation can be hundreds of KB — the UI never needs it.
-  const { controller, conversation, ...state } = searchRun;
+  // conversation can be hundreds of KB — the UI never needs it; the controllers
+  // aren't structured-cloneable.
+  const { controller, chatController, conversation, ...state } = searchRun;
   return state;
 }
 
 // -------------------------------------------------------------- follow-up ----
 
-async function startFollowUp(question) {
+async function startFollowUp(question, sessionId) {
   if (!question) throw new SkillError("追问内容为空。");
+  if (starting) throw new SkillError("正在启动新的搜索，请稍候。");
   if (!searchRun || searchRun.status !== "done" || !searchRun.conversation) {
     throw new SkillError("当前没有可追问的搜索结果。");
   }
   if (searchRun.chatBusy) throw new SkillError("上一个追问还在处理中，请稍候。");
-  const { llmConfig } = await chrome.storage.local.get("llmConfig");
-  if (!llmConfig?.apiKey || !llmConfig?.model) {
-    throw new SkillError("尚未配置 AI 模型。");
+  // The active session is global to the worker: if another surface switched it
+  // (e.g. the popup auto-opened a different history entry), answering here would
+  // silently attach this answer to someone else's conversation.
+  if (sessionId && searchRun.historyId && sessionId !== searchRun.historyId) {
+    throw new SkillError("当前会话已在其他窗口被切换，请刷新页面后再追问。");
   }
 
-  searchRun.chatBusy = true;
-  searchRun.pendingQuestion = question;
+  // Claim the session SYNCHRONOUSLY, before the first await: two asks dispatched
+  // in the same tick (two open surfaces) would otherwise both be accepted and
+  // mutate one conversation array, and a rollback from one would truncate the
+  // other's answered turn.
+  const run = searchRun;
+  const chatController = new AbortController();
+  run.chatController = chatController;
+  run.chatBusy = true;
+  run.pendingQuestion = question;
+
+  let llmConfig;
+  try {
+    ({ llmConfig } = await chrome.storage.local.get("llmConfig"));
+    if (!llmConfig?.apiKey || !llmConfig?.model) {
+      throw new SkillError("尚未配置 AI 模型。");
+    }
+    if (!ownsRun(run)) throw new SkillError("会话已切换，请刷新页面后重试。");
+  } catch (err) {
+    // Pre-flight failed: release the latch we just took.
+    run.chatBusy = false;
+    run.pendingQuestion = null;
+    run.chatController = null;
+    throw err;
+  }
+
   startKeepalive();
   (async () => {
     const outcome = { question };
     try {
       const result = await followUp({
         question,
-        conversation: searchRun.conversation,
+        conversation: run.conversation,
         llm: llmConfig,
         sy: syLocal,
-        onEvent: (event) => broadcast({ type: "sy.chatEvent", event }),
+        signal: chatController.signal,
+        options: run.options,
+        onEvent: (event) => {
+          if (ownsRun(run)) broadcast({ type: "sy.chatEvent", event });
+        },
       });
+      if (!ownsRun(run)) return; // session was switched/deleted under us
       const entry = { q: question, answer: result.answer, searched: result.searched, at: Date.now() };
-      searchRun.followUps.push(entry);
+      run.followUps.push(entry);
       Object.assign(outcome, { ok: true, ...entry });
-      await updateHistoryFromRun();
+      await persistRun(run);
+      outcome.historyError = run.historyError || null;
     } catch (err) {
+      if (!ownsRun(run)) return;
       outcome.ok = false;
-      outcome.error = err?.message || String(err);
+      outcome.error =
+        err?.name === "AbortError" ? "追问已停止。" : err?.message || String(err);
     } finally {
-      searchRun.chatBusy = false;
-      searchRun.pendingQuestion = null;
-      stopKeepalive();
-      broadcast({ type: "sy.chatDone", ...outcome });
+      // Always release the busy latch on the run we started on, even if it is no
+      // longer the active one — otherwise a switched-away session stays locked.
+      run.chatBusy = false;
+      run.pendingQuestion = null;
+      run.chatController = null;
+      if (ownsRun(run)) {
+        stopKeepalive();
+        broadcast({ type: "sy.chatDone", ...outcome });
+      }
     }
   })();
   return { accepted: true };
@@ -362,6 +523,9 @@ async function handleMessage(msg, sender) {
         data: {
           auth,
           llmConfigured: Boolean(llmConfig?.apiKey && llmConfig?.model),
+          // Non-null means credentials/history could not be written to disk —
+          // the user would otherwise silently lose their authorization.
+          storageError: __persistError(),
         },
       };
     }
@@ -372,16 +536,24 @@ async function handleMessage(msg, sender) {
     }
 
     case "sy.search.stop": {
+      const stopping = Boolean(searchRun?.status === "running" || searchRun?.chatBusy);
       searchRun?.controller?.abort();
-      return { ok: true, data: { stopping: Boolean(searchRun) } };
+      searchRun?.chatController?.abort();
+      return { ok: true, data: { stopping } };
     }
 
     case "sy.search.state": {
       return { ok: true, data: searchState() };
     }
 
+    case "sy.chat.stop": {
+      const stopping = Boolean(searchRun?.chatBusy);
+      searchRun?.chatController?.abort();
+      return { ok: true, data: { stopping } };
+    }
+
     case "sy.chat.ask": {
-      const data = await startFollowUp(String(msg.question || "").trim());
+      const data = await startFollowUp(String(msg.question || "").trim(), msg.sessionId || null);
       return { ok: true, data };
     }
 
@@ -400,11 +572,19 @@ async function handleMessage(msg, sender) {
     }
 
     case "sy.history.open": {
-      if (searchRun?.status === "running" || searchRun?.chatBusy) {
+      const before = searchRun;
+      if (starting || searchRun?.status === "running" || searchRun?.chatBusy) {
         throw new SkillError("有搜索或追问正在进行，请先等待完成或停止。");
       }
       const entry = (await loadHistory()).find((e) => e.id === msg.id);
       if (!entry) throw new SkillError("该历史记录不存在。");
+      // loadHistory() awaited: a search/follow-up may have started meanwhile.
+      // Installing this session anyway would orphan that run — it would keep
+      // burning forum/LLM calls with nobody listening, never release keepalive,
+      // and leave a stale activeRun marker that fakes an error on the next boot.
+      if (searchRun !== before || starting || searchRun?.status === "running" || searchRun?.chatBusy) {
+        throw new SkillError("有搜索或追问正在进行，请先等待完成或停止。");
+      }
       searchRun = {
         topic: entry.topic,
         options: {},
@@ -416,19 +596,31 @@ async function handleMessage(msg, sender) {
         startedAt: 0,
         finishedAt: entry.finishedAt,
         controller: null,
+        chatController: null,
         conversation: entry.conversation || null,
         followUps: entry.followUps || [],
         historyId: entry.id,
         chatBusy: false,
+        historyError: null,
       };
       return { ok: true, data: searchState() };
     }
 
     case "sy.history.delete": {
+      // Deleting the session that a follow-up is currently answering used to
+      // null out searchRun and crash that follow-up's finally block, leaving the
+      // UI spinning forever.
+      const busyWith = (run) => run?.status === "running" || run?.chatBusy;
+      if (searchRun?.historyId === msg.id && busyWith(searchRun)) {
+        throw new SkillError("该会话正在处理中，请先等待完成或停止后再删除。");
+      }
       const history = await loadHistory();
       const next = history.filter((e) => e.id !== msg.id);
       await chrome.storage.local.set({ [HISTORY_KEY]: next });
-      if (searchRun?.historyId === msg.id && searchRun.status !== "running") {
+      // Re-check after the awaits: an ask/search dispatched in the same tick may
+      // have claimed this run in the meantime, and dropping it would orphan that
+      // work (no sy.chatDone -> spinner forever).
+      if (searchRun?.historyId === msg.id && !busyWith(searchRun)) {
         searchRun = null;
       }
       return { ok: true, data: { deleted: history.length - next.length } };

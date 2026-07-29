@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "水源深度搜索 (Shuiyuan Deep Search)",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "AI 驱动的水源社区深度搜索：多智能体并行、同义词扩展、相似讨论自动发掘（只读）。",
   "minimum_chrome_version": "110",
   "background": {
@@ -16,7 +16,7 @@
     "page": "pages/setup.html",
     "open_in_tab": true
   },
-  "permissions": ["storage"],
+  "permissions": ["storage", "unlimitedStorage"],
   "host_permissions": ["https://shuiyuan.sjtu.edu.cn/*"],
   "optional_host_permissions": ["https://*/*"],
   "content_scripts": [

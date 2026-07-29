@@ -5,7 +5,11 @@ const $ = (id) => document.getElementById(id);
 
 function send(message) {
   return chrome.runtime.sendMessage(message).then((res) => {
-    if (!res) throw new Error("后台服务无响应，请重新加载扩展。");
+    if (!res) {
+      throw new Error(
+        "后台服务无响应，请重新加载扩展。（若是首次安装，请先在扩展目录执行 node sync-core.mjs 生成 core/）",
+      );
+    }
     if (!res.ok) {
       const err = new Error(res.error || "请求失败");
       err.data = res;
@@ -30,7 +34,14 @@ function setMsg(el, kind, text) {
 async function refreshAuthStatus() {
   const statusEl = $("auth-status");
   try {
-    const { auth } = await send({ type: "sy.status" });
+    const { auth, storageError } = await send({ type: "sy.status" });
+    if (storageError) {
+      setMsg(
+        $("auth-msg"),
+        "warn",
+        `警告：浏览器本地存储写入失败（${storageError}），凭证可能无法保存。请清理插件历史记录后重试。`,
+      );
+    }
     if (auth?.resolved?.found) {
       setStatus(statusEl, "ok", "已授权");
       $("auth-waiting").classList.add("hidden");
@@ -156,7 +167,10 @@ $("btn-llm-test").addEventListener("click", async () => {
     const cfg = await saveLlm({ silent: true });
     const reply = await chatComplete(cfg, {
       user: "请只回复两个字：正常",
-      maxTokens: 16,
+      // Generous on purpose: a reasoning model spends its budget on the thinking
+      // block first, and a 16-token cap would make every such model "fail".
+      maxTokens: 1024,
+      timeoutMs: 60_000,
     });
     setMsg($("llm-msg"), "ok", `连接成功，模型回复：${reply.trim().slice(0, 50)}`);
   } catch (err) {
