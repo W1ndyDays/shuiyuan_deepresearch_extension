@@ -385,9 +385,45 @@ function searchState() {
 
 // -------------------------------------------------------------- follow-up ----
 
+/**
+ * A completed session normally lives only in this worker's memory.  MV3 may
+ * reclaim an idle worker after the report is shown, leaving an open page with a
+ * valid `historyId` but no `searchRun`.  Restore that exact persisted session
+ * before accepting its follow-up instead of making the user refresh the page
+ * or manually open History.
+ */
+async function restoreHistorySessionForFollowUp(historyId) {
+  if (!historyId || searchRun || starting) return false;
+  const before = searchRun;
+  const entry = (await loadHistory()).find((e) => e.id === historyId);
+  // Do not overwrite a search/follow-up that claimed the worker while the
+  // history read was in flight.
+  if (searchRun !== before || starting || !entry?.conversation) return false;
+  searchRun = {
+    topic: entry.topic,
+    options: {},
+    status: "done",
+    events: [],
+    report: entry.report,
+    meta: entry.meta,
+    error: null,
+    startedAt: 0,
+    finishedAt: entry.finishedAt,
+    controller: null,
+    chatController: null,
+    conversation: entry.conversation,
+    followUps: entry.followUps || [],
+    historyId: entry.id,
+    chatBusy: false,
+    historyError: null,
+  };
+  return true;
+}
+
 async function startFollowUp(question, sessionId) {
   if (!question) throw new SkillError("追问内容为空。");
   if (starting) throw new SkillError("正在启动新的搜索，请稍候。");
+  await restoreHistorySessionForFollowUp(sessionId);
   if (!searchRun || searchRun.status !== "done" || !searchRun.conversation) {
     throw new SkillError("当前没有可追问的搜索结果。");
   }
